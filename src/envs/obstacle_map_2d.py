@@ -10,7 +10,7 @@ from math import ceil
 from matplotlib import pyplot as plt
 import torch
 import numpy as np
-
+from scipy.ndimage import distance_transform_edt as edt_transform
 
 @dataclass
 class CircleObstacle:
@@ -44,60 +44,41 @@ class RectangleObstacle:
 
 
 class ObstacleMap:
-    """
-    Obstacle map represented by a grid.
-    """
-
     def __init__(
         self,
         map_size: Tuple[int, int] = (20, 20),
-        cell_size: float = 0.01,
+        cell_size: float = 0.1,
         device=torch.device("cuda"),
         dtype=torch.float32,
+        min_distance: float = 0.2
     ) -> None:
-        """
-        map_size: (width, height) [m], origin is at the center
-        cell_size: (m)
-        """
-        # device and dtype
-        if torch.cuda.is_available() and device == torch.device("cuda"):
-            self._device = torch.device("cuda")
-        else:
-            self._device = torch.device("cpu")
+        self._device = device
         self._dtype = dtype
-
-        assert len(map_size) == 2
-        assert cell_size > 0
-        assert map_size[0] % 2 == 0
-        assert map_size[1] % 2 == 0
-
-        cell_map_dim = [0, 0]
-        cell_map_dim[0] = ceil(map_size[0] / cell_size)
-        cell_map_dim[1] = ceil(map_size[1] / cell_size)
-
-        self._map = np.zeros(cell_map_dim)
         self._cell_size = cell_size
+        self.min_distance = min_distance
 
-        # cell map center
+        # Initialize grid map
+        cell_map_dim = (
+            ceil(map_size[0] / cell_size),
+            ceil(map_size[1] / cell_size)
+        )
+        self._map = np.zeros(cell_map_dim)
         self._cell_map_origin = np.zeros(2)
         self._cell_map_origin = np.array(
             [cell_map_dim[0] / 2, cell_map_dim[1] / 2]
         ).astype(int)
-
-        self._torch_cell_map_origin = torch.from_numpy(self._cell_map_origin).to(
-            self._device, self._dtype
-        )
-
-        # limit of the map
-        x_range = self._cell_size * self._map.shape[0]
-        y_range = self._cell_size * self._map.shape[1]
-        self.x_lim = [-x_range / 2, x_range / 2]  # [m]
-        self.y_lim = [-y_range / 2, y_range / 2]  # [m]
-
-        # Inner variables
-        self._map_torch: torch.Tensor = None  # use to collision check on GPU
-        self.circle_obs_list: List[CircleObstacle] = []  # use to visualize
-        self.rectangle_obs_list: List[RectangleObstacle] = []  # use to visualize
+        
+        # SDF properties
+        self.sdf = None
+        self.sdf_torch = None
+        
+        # Map boundaries
+        self.x_lim = [-map_size[0]/2, map_size[0]/2]
+        self.y_lim = [-map_size[1]/2, map_size[1]/2]
+        
+        # Obstacle lists
+        self.circle_obs_list = []
+        self.rectangle_obs_list = []
 
     def add_circle_obstacle(self, center: np.ndarray, radius: float) -> None:
         """
@@ -160,47 +141,49 @@ class ObstacleMap:
         # add to rectangle obstacle list to use visualize
         self.rectangle_obs_list.append(RectangleObstacle(center, width, height))
 
-    def convert_to_torch(self) -> torch.Tensor:
-        self._map_torch = torch.from_numpy(self._map).to(self._device, self._dtype)
-        return self._map_torch
+    def convert_to_torch(self) -> None:
+        """Calculate SDF and convert to torch tensor"""
+        # Calculate signed distance field
+        obstacle_grid = self._map.astype(bool)
+        self.sdf = edt_transform(obstacle_grid)# - edt_transform(obstacle_grid)
+        self.sdf = self.sdf * self._cell_size  # Convert to meters
+        
+        # Convert to torch tensor
+        self.sdf_torch = torch.tensor(self.sdf.T,  # Transpose for correct orientation
+                                    device=self._device,
+                                    dtype=self._dtype)
 
     def compute_cost(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Check collision in a batch of trajectories.
-        :param x: Tensor of shape (batch_size, traj_length, position_dim).
-        :return: collsion costs on the trajectories.
-        """
-        assert self._map_torch is not None
-        if x.device != self._device or x.dtype != self._dtype:
-            x = x.to(self._device, self._dtype)
-
-        # project to cell map
-        x_occ = (x / self._cell_size) + self._torch_cell_map_origin
-        x_occ = torch.round(x_occ).long().to(self._device)
-
-        # deal with out of bound
-        is_out_of_bound = torch.logical_or(
-            torch.logical_or(
-                x_occ[..., 0] < 0, x_occ[..., 0] >= self._map_torch.shape[0]
-            ),
-            torch.logical_or(
-                x_occ[..., 1] < 0, x_occ[..., 1] >= self._map_torch.shape[1]
-            ),
-        )
-        x_occ[..., 0] = torch.clamp(x_occ[..., 0], 0, self._map_torch.shape[0] - 1)
-        x_occ[..., 1] = torch.clamp(x_occ[..., 1], 0, self._map_torch.shape[1] - 1)
-
-        # collision check
-        collisions = self._map_torch[x_occ[..., 0], x_occ[..., 1]]
-
-        # out of bound cost
-        collisions[is_out_of_bound] = 1.0
-
-        return collisions
+        """Compute distance to nearest obstacle"""
+        # Convert world coordinates to grid indices
+        x_norm = (x[..., 0] - self.x_lim[0]) / self._cell_size
+        y_norm = (x[..., 1] - self.y_lim[0]) / self._cell_size
+        
+        # Clamp indices to grid boundaries
+        x_idx = torch.clamp(x_norm.long(), 0, self._map.shape[0]-1)
+        y_idx = torch.clamp(y_norm.long(), 0, self._map.shape[1]-1)
+        
+        # Get distances from SDF
+        distances = self.sdf_torch[y_idx, x_idx]  # Transposed access
+        
+        # Add penalty for out-of-bound points
+        out_of_bounds = (x_norm < 0) | (x_norm >= self._map.shape[0]) | \
+                        (y_norm < 0) | (y_norm >= self._map.shape[1])
+        distances[out_of_bounds] = -self.min_distance
+        
+        return distances
 
     def render_occupancy(self, ax, cmap="binary") -> None:
         ax.imshow(self._map, cmap=cmap)
 
+    def render_sdf(self, ax):
+        im = ax.imshow(self.sdf.T, 
+                    extent=[*self.x_lim, *self.y_lim],
+                    cmap='coolwarm',
+                    vmin=-self.min_distance, 
+                    vmax=self.min_distance)
+        #plt.colorbar(im, ax=ax)
+    
     def render(self, ax, zorder: int = 0) -> None:
         """
         Render in continuous space.

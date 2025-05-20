@@ -9,23 +9,26 @@ import tqdm
 from controller.mppi import MPPI
 from envs.navigation_2d import Navigation2DEnv
 
+torch.set_num_threads(1)
 
 def main(save_mode: bool = False):
-    env = Navigation2DEnv()
+    device = torch.device("cpu")
+    env = Navigation2DEnv(device=device, min_distance=0.3)
 
     # solver
     solver = MPPI(
-        horizon=30,
+        horizon=8,
         num_samples=3000,
         dim_state=3,
-        dim_control=2,
+        dim_control=3,
         dynamics=env.dynamics,
         cost_func=env.cost_function,
         u_min=env.u_min,
         u_max=env.u_max,
-        sigmas=torch.tensor([0.5, 0.5]),
+        sigmas=torch.tensor([0.5, 0.5, 0.5]),
         lambda_=1.0,
-        auto_lambda=False,
+        auto_lambda=True,
+        device=device
     )
 
     state = env.reset()
@@ -36,6 +39,9 @@ def main(save_mode: bool = False):
         start = time.time()
         action_seq, state_seq = solver.forward(state=state)
         end = time.time()
+        
+        print(f"FPS: {1/(end-start):.2f}")
+        
         total_time += end - start
         step_count += 1
 

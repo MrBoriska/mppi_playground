@@ -24,7 +24,8 @@ def angle_normalize(x):
 
 class Navigation2DEnv:
     def __init__(
-        self, device=torch.device("cuda"), dtype=torch.float32, seed: int = 42
+        self, device=torch.device("cuda"), dtype=torch.float32, seed: int = 42,
+        min_distance: float = 0.2
     ) -> None:
         # device and dtype
         if torch.cuda.is_available() and device == torch.device("cuda"):
@@ -32,9 +33,10 @@ class Navigation2DEnv:
         else:
             self._device = torch.device("cpu")
         self._dtype = dtype
+        self.min_distance = min_distance
 
         self._obstacle_map = ObstacleMap(
-            map_size=(20, 20), cell_size=0.1, device=self._device, dtype=self._dtype
+            map_size=(20, 20), cell_size=0.1, device=self._device, dtype=self._dtype, min_distance=self.min_distance
         )
         self._seed = seed
 
@@ -69,8 +71,14 @@ class Navigation2DEnv:
         )
 
         # u: [v, omega] (m/s, rad/s)
-        self.u_min = torch.tensor([0.0, -1.0], device=self._device, dtype=self._dtype)
-        self.u_max = torch.tensor([2.0, 1.0], device=self._device, dtype=self._dtype)
+        self.u_min = torch.tensor([-0.8, -0.2, -1.0], device=self._device, dtype=self._dtype)
+        self.u_max = torch.tensor([0.8, 0.2, 1.0], device=self._device, dtype=self._dtype)
+        
+        self.robot_shape = torch.tensor([
+            [-(0.5-0.2), 0.0],
+            [0.0, 0.0],
+            [(0.5-0.2), 0.0]
+        ], device=self._device, dtype=self._dtype)
 
     def reset(self) -> torch.Tensor:
         """
@@ -130,6 +138,7 @@ class Navigation2DEnv:
 
         # obstacle map
         self._obstacle_map.render(self._ax, zorder=10)
+        #self._obstacle_map.render_sdf(self._ax)
 
         # start and goal
         self._ax.scatter(
@@ -148,12 +157,55 @@ class Navigation2DEnv:
         )
 
         # robot
+        # self._ax.scatter(
+        #     self._robot_state[0].item(),
+        #     self._robot_state[1].item(),
+        #     marker="o",
+        #     color="green",
+        #     zorder=100,
+        # )
+        # Получаем текущее состояние робота [x, y, theta]
+        x = self._robot_state[0].item()
+        y = self._robot_state[1].item()
+        theta = self._robot_state[2].item()
+
+        # Преобразуем форму робота в numpy array (3, 2)
+        robot_shape = self.robot_shape.detach().cpu().numpy()
+
+        # Вычисляем преобразование координат для каждой точки
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+
+        # Преобразование всех точек
+        global_points = np.array([
+            [
+                x + (p[0] * cos_theta - p[1] * sin_theta),
+                y + (p[0] * sin_theta + p[1] * cos_theta)
+            ] for p in robot_shape
+        ])
+
+        # Разделяем координаты X и Y
+        xs = global_points[:, 0]
+        ys = global_points[:, 1]
+
+        # Рисуем три точки формы и центр
         self._ax.scatter(
-            self._robot_state[0].item(),
-            self._robot_state[1].item(),
+            xs,
+            ys,
             marker="o",
             color="green",
-            zorder=100,
+            s=40,  # Размер точек
+            zorder=100
+        )
+
+        # Центральная точка (опционально)
+        self._ax.scatter(
+            x,
+            y,
+            marker="o",
+            color="red",
+            s=30,
+            zorder=101
         )
 
         # visualize top samples with different alpha based on weights
@@ -234,12 +286,13 @@ class Navigation2DEnv:
         x = state[:, 0].view(-1, 1)
         y = state[:, 1].view(-1, 1)
         theta = state[:, 2].view(-1, 1)
-        v = torch.clamp(action[:, 0].view(-1, 1), self.u_min[0], self.u_max[0])
-        omega = torch.clamp(action[:, 1].view(-1, 1), self.u_min[1], self.u_max[1])
+        vx = torch.clamp(action[:, 0].view(-1, 1), self.u_min[0], self.u_max[0])
+        vy = torch.clamp(action[:, 1].view(-1, 1), self.u_min[1], self.u_max[1])
+        omega = torch.clamp(action[:, 2].view(-1, 1), self.u_min[2], self.u_max[2])
         theta = angle_normalize(theta)
 
-        new_x = x + v * torch.cos(theta) * delta_t
-        new_y = y + v * torch.sin(theta) * delta_t
+        new_x = x + vx * torch.cos(theta) * delta_t - vy * torch.sin(theta) * delta_t
+        new_y = y + vx * torch.sin(theta) * delta_t + vy * torch.cos(theta) * delta_t
         new_theta = angle_normalize(theta + omega * delta_t)
 
         # Clamp x and y to the map boundary
@@ -261,7 +314,7 @@ class Navigation2DEnv:
         Calculate cost function
         Args:
             state (torch.Tensor): state batch tensor, shape (batch_size, 3) [x, y, theta]
-            action (torch.Tensor): control batch tensor, shape (batch_size, 2) [v, omega]
+            action (torch.Tensor): control batch tensor, shape (batch_size, 3) [vx, vy, omega]
         Returns:
             torch.Tensor: shape (batch_size,)
         """
@@ -281,12 +334,27 @@ class Navigation2DEnv:
 
     def collision_check(self, state: torch.Tensor) -> torch.Tensor:
         """
-
-        Args:
-            state (torch.Tensor): state batch tensor, shape (batch_size, traj_size , 3) [x, y, theta]
-        Returns:
-            torch.Tensor: shape (batch_size,)
+        Проверяет коллизии с учетом SDF и минимального расстояния
         """
-        pos_batch = state[:, :, :2]
-        is_collisions = self._obstacle_map.compute_cost(pos_batch).squeeze(1)
+        batch_size, traj_size = state.shape[:2]
+        
+        # Преобразование точек формы робота
+        robot_shape = self.robot_shape.to(state.device)
+        dx = robot_shape[:, 0].view(1, 1, -1, 1)
+        dy = robot_shape[:, 1].view(1, 1, -1, 1)
+
+        theta = state[..., 2]
+        cos_theta = torch.cos(theta).unsqueeze(-1).unsqueeze(-1)
+        sin_theta = torch.sin(theta).unsqueeze(-1).unsqueeze(-1)
+
+        # Глобальные координаты точек робота
+        global_x = state[..., 0].unsqueeze(-1).unsqueeze(-1) + dx * cos_theta - dy * sin_theta
+        global_y = state[..., 1].unsqueeze(-1).unsqueeze(-1) + dx * sin_theta + dy * cos_theta
+        pos_points = torch.cat([global_x, global_y], dim=-1).view(batch_size, traj_size * 3, 2)
+
+        # Получение расстояний до препятствий
+        distances = self._obstacle_map.compute_cost(pos_points)
+        
+        # Проверка нарушений минимального расстояния
+        is_collisions = (distances < self.min_distance).any(dim=1)
         return is_collisions

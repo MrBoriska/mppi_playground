@@ -63,7 +63,7 @@ class MPPI(nn.Module):
 
         # torch seed
         torch.manual_seed(seed)
-
+        
         # check dimensions
         assert u_min.shape == (dim_control,)
         assert u_max.shape == (dim_control,)
