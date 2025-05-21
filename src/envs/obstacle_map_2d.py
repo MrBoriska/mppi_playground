@@ -145,7 +145,7 @@ class ObstacleMap:
         """Calculate SDF and convert to torch tensor"""
         # Calculate signed distance field
         obstacle_grid = self._map.astype(bool)
-        self.sdf = edt_transform(obstacle_grid)# - edt_transform(obstacle_grid)
+        self.sdf = edt_transform(~obstacle_grid) - edt_transform(obstacle_grid)
         self.sdf = self.sdf * self._cell_size  # Convert to meters
         
         # Convert to torch tensor
@@ -177,11 +177,9 @@ class ObstacleMap:
         ax.imshow(self._map, cmap=cmap)
 
     def render_sdf(self, ax):
-        im = ax.imshow(self.sdf.T, 
+        im = ax.imshow(np.rot90(self.sdf), 
                     extent=[*self.x_lim, *self.y_lim],
-                    cmap='coolwarm',
-                    vmin=-self.min_distance, 
-                    vmax=self.min_distance)
+                    cmap='turbo')
         #plt.colorbar(im, ax=ax)
     
     def render(self, ax, zorder: int = 0) -> None:

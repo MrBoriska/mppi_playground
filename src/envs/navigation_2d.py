@@ -270,10 +270,10 @@ class Navigation2DEnv:
             clip.write_gif(path, fps=10)
 
     def dynamics(
-        self, state: torch.Tensor, action: torch.Tensor, delta_t: float = 0.1
+        self, state: torch.Tensor, action: torch.Tensor, delta_t: float = 0.25
     ) -> torch.Tensor:
         """
-        Update robot state based on differential drive dynamics.
+        Update robot state based on omnidirectional dynamics.
         Args:
             state (torch.Tensor): state batch tensor, shape (batch_size, 3) [x, y, theta]
             action (torch.Tensor): control batch tensor, shape (batch_size, 2) [v, omega]
@@ -311,50 +311,60 @@ class Navigation2DEnv:
 
     def cost_function(self, state: torch.Tensor, action: torch.Tensor, info: dict) -> torch.Tensor:
         """
-        Calculate cost function
-        Args:
-            state (torch.Tensor): state batch tensor, shape (batch_size, 3) [x, y, theta]
-            action (torch.Tensor): control batch tensor, shape (batch_size, 3) [vx, vy, omega]
-        Returns:
-            torch.Tensor: shape (batch_size,)
+        Calculate cost function with robot shape consideration
         """
-
+        # Calculate goal cost
         goal_cost = torch.norm(state[:, :2] - self._goal_pos, dim=1)
+        
+        # Get distances for all robot shape points
+        distances = self.get_distances(state.unsqueeze(1))  # Add trajectory dimension
+        
+        # Calculate obstacle proximity cost
+        #safety_margin = self.min_distance
+        obstacle_penalty = torch.clamp(self.min_distance - distances, min=0)
+        
+        # Sum penalties across all points and time steps
+        obstacle_cost = distances.pow(2).sum(dim=1)
+        
+        # Combine costs
+        total_cost = goal_cost + 1000 * obstacle_penalty.sum(dim=1) + 1.0/obstacle_cost
+        
+        return total_cost
 
-        pos_batch = state[:, :2].unsqueeze(1)  # (batch_size, 1, 2)
-
-        obstacle_cost = self._obstacle_map.compute_cost(pos_batch).squeeze(
-            1
-        )  # (batch_size,)
-
-        cost = goal_cost + 10000 * obstacle_cost
-
-        return cost
-
-
-    def collision_check(self, state: torch.Tensor) -> torch.Tensor:
+    def get_distances(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Проверяет коллизии с учетом SDF и минимального расстояния
+        Calculate distances for robot shape points (batched version)
+        Args:
+            state: (batch_size, traj_size, 3) tensor with [x, y, theta]
+        Returns:
+            distances: (batch_size, traj_size*3) tensor of distances
         """
         batch_size, traj_size = state.shape[:2]
         
-        # Преобразование точек формы робота
+        # Calculate transformed points
         robot_shape = self.robot_shape.to(state.device)
         dx = robot_shape[:, 0].view(1, 1, -1, 1)
         dy = robot_shape[:, 1].view(1, 1, -1, 1)
-
+        
         theta = state[..., 2]
         cos_theta = torch.cos(theta).unsqueeze(-1).unsqueeze(-1)
         sin_theta = torch.sin(theta).unsqueeze(-1).unsqueeze(-1)
-
-        # Глобальные координаты точек робота
+        
+        # Global coordinates calculation
         global_x = state[..., 0].unsqueeze(-1).unsqueeze(-1) + dx * cos_theta - dy * sin_theta
         global_y = state[..., 1].unsqueeze(-1).unsqueeze(-1) + dx * sin_theta + dy * cos_theta
-        pos_points = torch.cat([global_x, global_y], dim=-1).view(batch_size, traj_size * 3, 2)
-
-        # Получение расстояний до препятствий
-        distances = self._obstacle_map.compute_cost(pos_points)
         
-        # Проверка нарушений минимального расстояния
-        is_collisions = (distances < self.min_distance).any(dim=1)
-        return is_collisions
+        # Combine and reshape for distance query
+        pos_points = torch.cat([global_x, global_y], dim=-1)
+        pos_points = pos_points.view(batch_size, traj_size * 3, 2)
+        
+        # Query distances from obstacle map
+        return self._obstacle_map.compute_cost(pos_points)
+    
+    
+    def collision_check(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Check collisions considering safety margin
+        """
+        distances = self.get_distances(state)
+        return (distances < self.min_distance).any(dim=1)
