@@ -40,7 +40,11 @@ def main(save_mode: bool = False):
         action_seq, state_seq = solver.forward(state=state)
         end = time.time()
         
-        print(f"FPS: {1/(end-start):.2f}")
+        
+        print(
+            f"u: {action_seq[0, 0]:.3f} {action_seq[0, 1]:.3f} {action_seq[0, 2]:.3f} \
+            FPS: {1/(end-start):.2f}"
+        )
         
         total_time += end - start
         step_count += 1
