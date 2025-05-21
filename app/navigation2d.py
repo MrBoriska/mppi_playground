@@ -17,8 +17,8 @@ def main(save_mode: bool = False):
 
     # solver
     solver = MPPI(
-        horizon=20,
-        num_samples=3000,
+        horizon=8,
+        num_samples=1000,
         dim_state=3,
         dim_control=3,
         dynamics=env.dynamics,

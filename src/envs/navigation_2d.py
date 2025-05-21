@@ -327,7 +327,7 @@ class Navigation2DEnv:
         obstacle_cost = distances.pow(2).sum(dim=1)
         
         # Combine costs
-        total_cost = goal_cost + 1000 * obstacle_penalty.sum(dim=1) + 1.0/obstacle_cost
+        total_cost = goal_cost + 1000 * obstacle_penalty.pow(2).sum(dim=1) + 10.0/obstacle_cost
         
         return total_cost
 
