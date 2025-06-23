@@ -26,6 +26,7 @@ class MPPI(nn.Module):
         cost_func: Callable[[torch.Tensor, torch.Tensor, Dict], torch.Tensor],
         u_min: torch.Tensor,
         u_max: torch.Tensor,
+        a_max: torch.Tensor,
         sigmas: torch.Tensor,
         lambda_: float,
         auto_lambda: bool = False,
@@ -48,6 +49,7 @@ class MPPI(nn.Module):
         :param cost_func: Cost function.
         :param u_min: Minimum control.
         :param u_max: Maximum control.
+        :param a_max: Maximum acceleration control. Need product with time delta
         :param sigmas: Noise standard deviation for each control dimension.
         :param lambda_: temperature parameter.
         :param exploration: Exploration rate when sampling.
@@ -87,6 +89,7 @@ class MPPI(nn.Module):
         self._cost_func = cost_func
         self._u_min = u_min.clone().detach().to(self._device, self._dtype)
         self._u_max = u_max.clone().detach().to(self._device, self._dtype)
+        self._max_accel = a_max.clone().detach().to(self._device, self._dtype) # * delta_t for acceleration to velocity space
         self._sigmas = sigmas.clone().detach().to(self._device, self._dtype)
         self._lambda = lambda_
         self._exploration = exploration
@@ -210,6 +213,52 @@ class MPPI(nn.Module):
         self._perturbed_action_seqs = torch.clamp(
             self._perturbed_action_seqs, self._u_min, self._u_max
         )
+        
+        # Ограничение на ускорение (если задано)
+        if hasattr(self, '_max_accel') and self._max_accel is not None:
+            # Получаем текущее состояние (последнее примененное действие)
+            # Предполагаем, что self._current_action хранит последнее примененное действие
+            current_action = mean_action_seq[:1,:]  # [action_dim]
+            
+            # Преобразуем текущее действие в нужную размерность [batch, 1, action_dim]
+            current_action = current_action.reshape(1, 1, -1).expand(
+                self._perturbed_action_seqs.size(0), 1, -1
+            )
+            
+            # Вычисляем изменения от текущего состояния к первому шагу
+            first_delta = self._perturbed_action_seqs[:, :1, :] - current_action
+            
+            # Ограничиваем первое изменение (от текущего состояния к первому шагу)
+            clamped_first_delta = torch.clamp(
+                first_delta, 
+                -self._max_accel, 
+                self._max_accel
+            )
+            
+            # Применяем ограниченное изменение к первому шагу
+            first_step = current_action + clamped_first_delta
+            
+            # Вычисляем изменения между последующими шагами
+            deltas = torch.diff(self._perturbed_action_seqs, dim=1)
+            
+            # Ограничиваем изменения между шагами
+            clamped_deltas = torch.clamp(
+                deltas, 
+                -self._max_accel, 
+                self._max_accel
+            )
+            
+            # Восстанавливаем последовательность:
+            # 1. Первый шаг (уже ограничен относительно текущего состояния)
+            # 2. Последующие шаги = первый шаг + кумулятивная сумма ограниченных дельт
+            cumsum = torch.cat([
+                first_step, 
+                first_step + clamped_deltas.cumsum(dim=1)
+            ], dim=1)
+            
+            # Повторное ограничение по скорости
+            self._perturbed_action_seqs = torch.clamp(cumsum, self._u_min, self._u_max)
+        
 
         # rollout samples in parallel
         self._state_seq_batch[:, 0, :] = state.repeat(self._num_samples, 1)
