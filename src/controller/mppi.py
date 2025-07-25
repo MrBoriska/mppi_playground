@@ -166,7 +166,7 @@ class MPPI(nn.Module):
             )
             self.optimizer = torch.optim.Adam([self.log_tempature], lr=1e-2)
 
-    def reset(self):
+    def reset(self, current_u=None):
         """
         Reset the previous action sequence.
         """
@@ -176,6 +176,10 @@ class MPPI(nn.Module):
         self._actions_history_for_sg = torch.zeros(
             self._horizon - 1, self._dim_control, device=self._device, dtype=self._dtype
         )  # previous inputted actions for sg filter
+        
+        if current_u:
+            self._previous_action_seq[0, :] = torch.tensor(current_u, device=self._device, dtype=self._dtype)
+        
 
     def forward(
         self, state: torch.Tensor, info: Dict = {}
