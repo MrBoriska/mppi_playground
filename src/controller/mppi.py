@@ -181,6 +181,24 @@ class MPPI(nn.Module):
             self._previous_action_seq[0, :] = torch.tensor(current_u, device=self._device, dtype=self._dtype)
         
 
+    def abs_clamp(self, x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor, min_abs: torch.Tensor) -> torch.Tensor:
+        # Гарантируем, что min_abs неотрицательный
+        min_abs = torch.maximum(min_abs, torch.zeros_like(min_abs))
+        
+        # Стандартное ограничение значений
+        x = torch.clamp(x, min=min_val, max=max_val)
+        
+        # Создаем маски для корректировки
+        mask_pos = (x >= 0) & (x < min_abs) & (min_abs <= max_val)
+        mask_neg = (x < 0) & (x > -min_abs) & (min_val <= -min_abs)
+        
+        # Применяем корректировку
+        x = torch.where(mask_pos, min_abs, x)
+        x = torch.where(mask_neg, -min_abs, x)
+        
+        return x
+    
+    
     def forward(
         self, state: torch.Tensor, info: Dict = {}
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -214,8 +232,8 @@ class MPPI(nn.Module):
         )
 
         # clamp actions
-        self._perturbed_action_seqs = torch.clamp(
-            self._perturbed_action_seqs, self._u_min, self._u_max
+        self._perturbed_action_seqs = self.abs_clamp(
+            self._perturbed_action_seqs, self._u_min, self._u_max, torch.tensor([0.3,0.3,0.3])
         )
         
         # Ограничение на ускорение (если задано)
